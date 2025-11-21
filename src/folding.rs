@@ -1,17 +1,63 @@
 use ark_bn254::Bn254;
 use ark_ec::pairing::Pairing;
-use ark_ff::PrimeField;
-use ark_serialize::CanonicalSerialize;
-use ark_std::vec::Vec;
+use ark_ff::{Field, PrimeField};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_std::{vec::Vec, Zero};
 use sha3::{Digest, Keccak256};
 
-use crate::{groth16::*, FieldElement, SnarkFoldError, SnarkFoldResult as Result};
+use crate::{groth16::*, FieldElement, SnarkFoldError, SnarkFoldResult as Result, GT};
 
 /// Augmented Relaxed Groth16 Folding Scheme
 /// Implements the protocol from Section 4.1 of the paper
 pub struct AugmentedGroth16Folder;
 
 impl AugmentedGroth16Folder {
+    /// Helper function to accumulate GT error terms
+    /// Computes E* = E1 · (T')^r · (E2)^(r²)
+    fn accumulate_gt_error(
+        e1_bytes: &[u8],
+        t_prime_bytes: &[u8],
+        e2_bytes: &[u8],
+        r: FieldElement,
+        r_squared: FieldElement,
+    ) -> Result<Vec<u8>> {
+        // Deserialize GT elements (or use identity if empty)
+        let e1 = if e1_bytes.is_empty() {
+            GT::zero()
+        } else {
+            GT::deserialize_compressed(e1_bytes)
+                .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?
+        };
+
+        let t_prime = if t_prime_bytes.is_empty() {
+            GT::zero()
+        } else {
+            GT::deserialize_compressed(t_prime_bytes)
+                .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?
+        };
+
+        let e2 = if e2_bytes.is_empty() {
+            GT::zero()
+        } else {
+            GT::deserialize_compressed(e2_bytes)
+                .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?
+        };
+
+        // Compute E* = E1 · (T')^r · (E2)^(r²)
+        // In GT (multiplicative group), exponentiation is scalar multiplication
+        let t_prime_r = t_prime.pow(r.into_bigint());
+        let e2_r_squared = e2.pow(r_squared.into_bigint());
+        let e_star = e1 * t_prime_r * e2_r_squared;
+
+        // Serialize result
+        let mut result = Vec::new();
+        e_star
+            .serialize_compressed(&mut result)
+            .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?;
+
+        Ok(result)
+    }
+
     /// Compute cross terms (Equation 3 from paper)
     /// T = (T', R, ⃗t, κ) where:
     /// - T' = e(A1, B2) · e(A2, B1)
@@ -90,8 +136,14 @@ impl AugmentedGroth16Folder {
         let mu_star = inst1.mu + r * inst2.mu;
 
         // E* = E1 · (T')^r · (E2)^(r²)
-        // For now we'll handle this symbolically since GT operations are expensive
-        let error_gt_star = Vec::new(); // TODO: Implement proper GT accumulation
+        // Implement proper GT accumulation as per Equation 4 from the paper
+        let error_gt_star = Self::accumulate_gt_error(
+            &inst1.error_gt,
+            &cross_terms.t_prime,
+            &inst2.error_gt,
+            r,
+            r_squared,
+        )?;
 
         // R* = R1 · R^r · (R2)^(r²)
         let r_star = inst1.r + (cross_terms.r * r) + (inst2.r * r_squared);
