@@ -2,10 +2,8 @@ use ark_ff::{One, Zero};
 use ark_std::vec::Vec;
 
 use crate::{
-    folding::AugmentedGroth16Folder,
-    groth16::*,
-    hash::SnarkFoldHash,
-    FieldElement, G1, G2, SnarkFoldResult as Result,
+    folding::AugmentedGroth16Folder, groth16::*, hash::SnarkFoldHash, FieldElement,
+    SnarkFoldResult as Result, G1, G2,
 };
 
 /// IVC Proof for SnarkFold (Figure 3 from paper)
@@ -68,9 +66,7 @@ impl IVCProver {
             is_relaxed: false,
         };
 
-        let trivial_circuit_witness = CircuitWitness {
-            dummy: vec![],
-        };
+        let trivial_circuit_witness = CircuitWitness { dummy: vec![] };
 
         IVCProof {
             binding_claim: FieldElement::zero(),
@@ -94,10 +90,8 @@ impl IVCProver {
         // Step 1: Compute new binding claim
         // hi ← Hash(ui, hi-1)
         let instance_hash = Self::hash_instance(instance)?;
-        let binding_claim = SnarkFoldHash::hash_two(
-            &instance_hash,
-            &previous_ivc_proof.binding_claim
-        )?;
+        let binding_claim =
+            SnarkFoldHash::hash_two(&instance_hash, &previous_ivc_proof.binding_claim)?;
 
         // Step 2: Convert current proof to augmented relaxed form
         let current_instance = AugmentedRelaxedInstance::from_instance(instance);
@@ -118,27 +112,21 @@ impl IVCProver {
             &cross_terms,
         )?;
 
-        let (running_snark_instance, running_snark_proof) =
-            AugmentedGroth16Folder::fold_prover(
-                &current_proof,
-                &current_instance,
-                &previous_ivc_proof.running_snark_proof,
-                &previous_ivc_proof.running_snark_instance,
-                &cross_terms,
-                challenge,
-            )?;
+        let (running_snark_instance, running_snark_proof) = AugmentedGroth16Folder::fold_prover(
+            &current_proof,
+            &current_instance,
+            &previous_ivc_proof.running_snark_proof,
+            &previous_ivc_proof.running_snark_instance,
+            &cross_terms,
+            challenge,
+        )?;
 
         // Step 4: Fold circuit instances (simplified for now)
         // In a full implementation, this would fold R1CS instances using Nova-style folding
-        let circuit_instance = Self::create_circuit_instance(
-            step,
-            &binding_claim,
-            &running_snark_instance,
-        )?;
+        let circuit_instance =
+            Self::create_circuit_instance(step, &binding_claim, &running_snark_instance)?;
 
-        let circuit_witness = CircuitWitness {
-            dummy: vec![],
-        };
+        let circuit_witness = CircuitWitness { dummy: vec![] };
 
         let running_circuit_instance = circuit_instance.clone();
         let running_circuit_witness = circuit_witness.clone();
@@ -166,10 +154,7 @@ impl IVCProver {
         running_instance: &AugmentedRelaxedInstance,
     ) -> Result<CircuitInstance> {
         // In practice: uC,i.x ← Hash(vk, i, hi, u*i, u*C,i)
-        let mut data = vec![
-            FieldElement::from(step as u64),
-            *binding_claim,
-        ];
+        let mut data = vec![FieldElement::from(step as u64), *binding_claim];
         data.extend_from_slice(&running_instance.a_vec);
         data.push(running_instance.mu);
 
@@ -195,10 +180,7 @@ impl IVCVerifier {
     ) -> Result<bool> {
         // Check 1: Verify circuit instance hash
         // uC,i.x = Hash(vk, i, hi, u*i, u*C,i)
-        let mut data = vec![
-            FieldElement::from(step as u64),
-            ivc_proof.binding_claim,
-        ];
+        let mut data = vec![FieldElement::from(step as u64), ivc_proof.binding_claim];
         data.extend_from_slice(&ivc_proof.running_snark_instance.a_vec);
         data.push(ivc_proof.running_snark_instance.mu);
 
@@ -234,10 +216,10 @@ impl From<AugmentedRelaxedInstance> for CircuitInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{G1, G2, FieldElement};
+    use crate::{FieldElement, G1, G2};
+    use ark_std::rand::SeedableRng;
     use ark_std::{UniformRand, Zero};
     use rand_chacha::ChaCha20Rng;
-    use ark_std::rand::SeedableRng;
 
     #[test]
     fn test_ivc_init() {

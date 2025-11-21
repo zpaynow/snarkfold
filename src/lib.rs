@@ -1,14 +1,14 @@
-pub mod groth16;
-pub mod ivc;
-pub mod folding;
-pub mod hash;
 pub mod error;
+pub mod folding;
+pub mod groth16;
+pub mod hash;
+pub mod ivc;
 
-pub use groth16::*;
-pub use ivc::*;
-pub use folding::*;
-pub use hash::*;
 pub use error::*;
+pub use folding::*;
+pub use groth16::*;
+pub use hash::*;
+pub use ivc::*;
 
 // Re-export for convenience
 pub use error::SnarkFoldResult as Result;

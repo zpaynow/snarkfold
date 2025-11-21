@@ -1,7 +1,7 @@
+use crate::{FieldElement, SnarkFoldError, SnarkFoldResult as Result};
 use ark_ff::PrimeField;
 use ark_serialize::CanonicalSerialize;
-use sha2::{Digest, Sha256};
-use crate::{SnarkFoldResult as Result, SnarkFoldError, FieldElement};
+use sha3::{Digest, Keccak256};
 
 /// Hash function for SnarkFold (collision-resistant hash)
 pub struct SnarkFoldHash;
@@ -9,9 +9,10 @@ pub struct SnarkFoldHash;
 impl SnarkFoldHash {
     /// Hash a single field element
     pub fn hash_one(input: &FieldElement) -> Result<FieldElement> {
-        let mut hasher = Sha256::new();
+        let mut hasher = Keccak256::new();
         let mut bytes = Vec::new();
-        input.serialize_compressed(&mut bytes)
+        input
+            .serialize_compressed(&mut bytes)
             .map_err(|e| SnarkFoldError::HashError(format!("Serialization failed: {}", e)))?;
         hasher.update(&bytes);
         let result = hasher.finalize();
@@ -22,7 +23,7 @@ impl SnarkFoldHash {
 
     /// Hash two elements together
     pub fn hash_two(a: &FieldElement, b: &FieldElement) -> Result<FieldElement> {
-        let mut hasher = Sha256::new();
+        let mut hasher = Keccak256::new();
         let mut bytes = Vec::new();
 
         a.serialize_compressed(&mut bytes)
@@ -38,11 +39,12 @@ impl SnarkFoldHash {
 
     /// Hash multiple field elements
     pub fn hash_many(inputs: &[FieldElement]) -> Result<FieldElement> {
-        let mut hasher = Sha256::new();
+        let mut hasher = Keccak256::new();
         let mut bytes = Vec::new();
 
         for input in inputs {
-            input.serialize_compressed(&mut bytes)
+            input
+                .serialize_compressed(&mut bytes)
                 .map_err(|e| SnarkFoldError::HashError(format!("Serialization failed: {}", e)))?;
         }
 
@@ -54,7 +56,7 @@ impl SnarkFoldHash {
 
     /// Hash with arbitrary serializable data
     pub fn hash_arbitrary<T: CanonicalSerialize>(data: &T) -> Result<FieldElement> {
-        let mut hasher = Sha256::new();
+        let mut hasher = Keccak256::new();
         let mut bytes = Vec::new();
 
         data.serialize_compressed(&mut bytes)
@@ -71,9 +73,9 @@ impl SnarkFoldHash {
 mod tests {
     use super::*;
     use crate::FieldElement;
+    use ark_std::rand::SeedableRng;
     use ark_std::UniformRand;
     use rand_chacha::ChaCha20Rng;
-    use ark_std::rand::SeedableRng;
 
     #[test]
     fn test_hash_one() {

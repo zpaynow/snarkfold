@@ -3,11 +3,9 @@ use ark_ec::pairing::Pairing;
 use ark_ff::PrimeField;
 use ark_serialize::CanonicalSerialize;
 use ark_std::vec::Vec;
+use sha3::{Digest, Keccak256};
 
-use crate::{
-    groth16::*,
-    FieldElement, SnarkFoldResult as Result, SnarkFoldError,
-};
+use crate::{groth16::*, FieldElement, SnarkFoldError, SnarkFoldResult as Result};
 
 /// Augmented Relaxed Groth16 Folding Scheme
 /// Implements the protocol from Section 4.1 of the paper
@@ -32,7 +30,8 @@ impl AugmentedGroth16Folder {
         let t_prime_gt = pairing1 + pairing2;
 
         let mut t_prime_bytes = Vec::new();
-        t_prime_gt.serialize_compressed(&mut t_prime_bytes)
+        t_prime_gt
+            .serialize_compressed(&mut t_prime_bytes)
             .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?;
 
         // Compute R = C1^(-μ2) · C2^(-μ1)
@@ -44,7 +43,7 @@ impl AugmentedGroth16Folder {
         let len = inst1.a_vec.len();
         if len != inst2.a_vec.len() {
             return Err(SnarkFoldError::FoldingError(
-                "Instance vectors must have same length".to_string()
+                "Instance vectors must have same length".to_string(),
             ));
         }
 
@@ -100,9 +99,7 @@ impl AugmentedGroth16Folder {
         // ⃗t* = ⃗t1 + r·⃗t + r²·⃗t2
         let mut t_vec_star = Vec::with_capacity(len);
         for i in 0..len {
-            t_vec_star.push(
-                inst1.t_vec[i] + r * cross_terms.t_vec[i] + r_squared * inst2.t_vec[i]
-            );
+            t_vec_star.push(inst1.t_vec[i] + r * cross_terms.t_vec[i] + r_squared * inst2.t_vec[i]);
         }
 
         // κ* = κ1 + r·κ + r²·κ2
@@ -158,9 +155,7 @@ impl AugmentedGroth16Folder {
 
         let mut t_vec_star = Vec::with_capacity(len);
         for i in 0..len {
-            t_vec_star.push(
-                inst1.t_vec[i] + r * cross_terms.t_vec[i] + r_squared * inst2.t_vec[i]
-            );
+            t_vec_star.push(inst1.t_vec[i] + r * cross_terms.t_vec[i] + r_squared * inst2.t_vec[i]);
         }
 
         let kappa_star = inst1.kappa + r * cross_terms.kappa + r_squared * inst2.kappa;
@@ -185,14 +180,18 @@ impl AugmentedGroth16Folder {
         let mut data_to_hash = Vec::new();
 
         // Serialize instances
-        inst1.serialize_compressed(&mut data_to_hash)
+        inst1
+            .serialize_compressed(&mut data_to_hash)
             .map_err(|e| SnarkFoldError::HashError(e.to_string()))?;
-        inst2.serialize_compressed(&mut data_to_hash)
+        inst2
+            .serialize_compressed(&mut data_to_hash)
             .map_err(|e| SnarkFoldError::HashError(e.to_string()))?;
 
         // Serialize cross terms
         data_to_hash.extend_from_slice(&cross_terms.t_prime);
-        cross_terms.r.serialize_compressed(&mut data_to_hash)
+        cross_terms
+            .r
+            .serialize_compressed(&mut data_to_hash)
             .map_err(|e| SnarkFoldError::HashError(e.to_string()))?;
 
         for t in &cross_terms.t_vec {
@@ -200,12 +199,13 @@ impl AugmentedGroth16Folder {
                 .map_err(|e| SnarkFoldError::HashError(e.to_string()))?;
         }
 
-        cross_terms.kappa.serialize_compressed(&mut data_to_hash)
+        cross_terms
+            .kappa
+            .serialize_compressed(&mut data_to_hash)
             .map_err(|e| SnarkFoldError::HashError(e.to_string()))?;
 
         // Hash to field element
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
+        let mut hasher = Keccak256::new();
         hasher.update(&data_to_hash);
         let hash_result = hasher.finalize();
 
@@ -216,9 +216,9 @@ impl AugmentedGroth16Folder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{G1, G2, FieldElement};
+    use crate::{FieldElement, G1, G2};
+    use ark_std::{rand::SeedableRng, One, UniformRand, Zero};
     use rand_chacha::ChaCha20Rng;
-    use ark_std::{rand::SeedableRng, UniformRand, Zero, One};
 
     #[test]
     fn test_cross_terms_computation() {
@@ -254,9 +254,8 @@ mod tests {
             kappa: FieldElement::zero(),
         };
 
-        let cross_terms = AugmentedGroth16Folder::compute_cross_terms(
-            &proof1, &inst1, &proof2, &inst2
-        ).unwrap();
+        let cross_terms =
+            AugmentedGroth16Folder::compute_cross_terms(&proof1, &inst1, &proof2, &inst2).unwrap();
 
         assert_eq!(cross_terms.t_vec.len(), 2);
     }
@@ -295,15 +294,20 @@ mod tests {
             kappa: FieldElement::zero(),
         };
 
-        let cross_terms = AugmentedGroth16Folder::compute_cross_terms(
-            &proof1, &inst1, &proof2, &inst2
-        ).unwrap();
+        let cross_terms =
+            AugmentedGroth16Folder::compute_cross_terms(&proof1, &inst1, &proof2, &inst2).unwrap();
 
         let challenge = FieldElement::rand(&mut rng);
 
         let (folded_inst, folded_proof) = AugmentedGroth16Folder::fold_prover(
-            &proof1, &inst1, &proof2, &inst2, &cross_terms, challenge
-        ).unwrap();
+            &proof1,
+            &inst1,
+            &proof2,
+            &inst2,
+            &cross_terms,
+            challenge,
+        )
+        .unwrap();
 
         assert!(!folded_proof.a.is_zero());
         assert_eq!(folded_inst.a_vec.len(), 1);

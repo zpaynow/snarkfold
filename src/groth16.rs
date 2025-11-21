@@ -3,7 +3,7 @@ use ark_groth16::{Proof as Groth16Proof, VerifyingKey};
 use ark_serialize::CanonicalSerialize;
 use ark_std::{vec::Vec, Zero};
 
-use crate::{FieldElement, G1, G2, SnarkFoldResult as Result, SnarkFoldError};
+use crate::{FieldElement, SnarkFoldError, SnarkFoldResult as Result, G1, G2};
 
 /// Regular Groth16 proof wrapper
 #[derive(Clone, Debug)]
@@ -73,7 +73,8 @@ impl AugmentedRelaxedInstance {
     /// Serialize to bytes for hashing
     pub fn serialize_compressed(&self, mut writer: impl ark_std::io::Write) -> Result<()> {
         // Serialize a_vec
-        (self.a_vec.len() as u32).serialize_compressed(&mut writer)
+        (self.a_vec.len() as u32)
+            .serialize_compressed(&mut writer)
             .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?;
         for a in &self.a_vec {
             a.serialize_compressed(&mut writer)
@@ -81,19 +82,23 @@ impl AugmentedRelaxedInstance {
         }
 
         // Serialize mu
-        self.mu.serialize_compressed(&mut writer)
+        self.mu
+            .serialize_compressed(&mut writer)
             .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?;
 
         // Serialize error_gt
-        writer.write_all(&self.error_gt)
+        writer
+            .write_all(&self.error_gt)
             .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?;
 
         // Serialize r
-        self.r.serialize_compressed(&mut writer)
+        self.r
+            .serialize_compressed(&mut writer)
             .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?;
 
         // Serialize t_vec
-        (self.t_vec.len() as u32).serialize_compressed(&mut writer)
+        (self.t_vec.len() as u32)
+            .serialize_compressed(&mut writer)
             .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?;
         for t in &self.t_vec {
             t.serialize_compressed(&mut writer)
@@ -101,7 +106,8 @@ impl AugmentedRelaxedInstance {
         }
 
         // Serialize kappa
-        self.kappa.serialize_compressed(&mut writer)
+        self.kappa
+            .serialize_compressed(&mut writer)
             .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?;
 
         Ok(())
@@ -164,10 +170,10 @@ impl GrothVerifyingKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{G1, G2, FieldElement};
+    use crate::{FieldElement, G1, G2};
+    use ark_std::rand::SeedableRng;
     use ark_std::{UniformRand, Zero};
     use rand_chacha::ChaCha20Rng;
-    use ark_std::rand::SeedableRng;
 
     #[test]
     fn test_instance_creation() {

@@ -1,7 +1,7 @@
-use snarkfold::*;
+use ark_std::rand::SeedableRng;
 use ark_std::UniformRand;
 use rand_chacha::ChaCha20Rng;
-use ark_std::rand::SeedableRng;
+use snarkfold::*;
 
 fn main() -> Result<()> {
     println!("SnarkFold: Groth16 Proof Aggregation Example");
@@ -28,10 +28,7 @@ fn main() -> Result<()> {
         };
 
         let instance = Instance {
-            public_inputs: vec![
-                FieldElement::rand(&mut rng),
-                FieldElement::rand(&mut rng),
-            ],
+            public_inputs: vec![FieldElement::rand(&mut rng), FieldElement::rand(&mut rng)],
         };
 
         proofs.push(proof);
@@ -52,12 +49,7 @@ fn main() -> Result<()> {
     // Step 3: Incrementally aggregate proofs
     println!("Step 3: Folding proofs incrementally...");
     for (i, (instance, proof)) in instances.iter().zip(proofs.iter()).enumerate() {
-        ivc_proof = IVCProver::prove_step(
-            i + 1,
-            instance,
-            proof,
-            &ivc_proof,
-        )?;
+        ivc_proof = IVCProver::prove_step(i + 1, instance, proof, &ivc_proof)?;
 
         if (i + 1) % 10 == 0 || i + 1 == num_proofs {
             println!("  Folded {}/{} proofs", i + 1, num_proofs);
@@ -86,25 +78,21 @@ fn main() -> Result<()> {
     } else {
         println!("✗ Binding claim mismatch!\n");
         return Err(SnarkFoldError::VerificationError(
-            "Binding claim mismatch".to_string()
+            "Binding claim mismatch".to_string(),
         ));
     }
 
     // Step 6: Online verification (constant time!)
     println!("Step 6: Online verification (O(1) time)...");
     let mock_vk = create_mock_verifying_key();
-    let verified = IVCVerifier::verify(
-        num_proofs,
-        &ivc_proof,
-        &mock_vk,
-    )?;
+    let verified = IVCVerifier::verify(num_proofs, &ivc_proof, &mock_vk)?;
 
     if verified {
         println!("✓ Aggregated proof VERIFIED!\n");
     } else {
         println!("✗ Aggregated proof REJECTED!\n");
         return Err(SnarkFoldError::VerificationError(
-            "Proof verification failed".to_string()
+            "Proof verification failed".to_string(),
         ));
     }
 
