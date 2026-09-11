@@ -1,357 +1,296 @@
-use ark_bn254::Bn254;
-use ark_ec::pairing::Pairing;
-use ark_ff::{Field, One, PrimeField, Zero};
-use ark_serialize::CanonicalDeserialize;
+//! Incremental aggregation of Groth16 proofs for one verifying key.
+//!
+//! `Aggregator` folds proofs one by one into a single augmented relaxed pair. The resulting
+//! [`AggregatedProof`] carries the per-step transcript (instance + cross terms), so a verifier
+//! can re-derive every Fiat–Shamir challenge, re-fold the *instances* (no pairings, only GT
+//! exponentiations and G1 scalar multiplications) and then check the final relaxed relation
+//! with 3 pairings.
+//!
+//! What this is and is not:
+//! - Verifying `n` aggregated proofs costs `n` instance folds + 3 pairings instead of `4n`
+//!   pairings, and the pairing work no longer grows with `n`.
+//! - The paper's O(1) verifier additionally needs the IVC circuit that proves the folding was
+//!   done correctly. That circuit is **not** implemented here; the `binding_claim`
+//!   (hᵢ = Hash(uᵢ, hᵢ₋₁)) is kept so the transcript commits to the instance sequence, but it
+//!   provides no succinctness on its own.
+//! - Everything folded must share one verifying key (⃗a is combined against `gamma_abc_g1`).
+
+use ark_ff::Zero;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::vec::Vec;
 
 use crate::{
-    folding::AugmentedGroth16Folder, groth16::*, hash::SnarkFoldHash, FieldElement,
-    SnarkFoldResult as Result, G1, G2,
+    folding::{verify_relaxed, AugmentedGroth16Folder},
+    groth16::*,
+    hash::SnarkFoldHash,
+    FieldElement, SnarkFoldError, SnarkFoldResult,
 };
 
-/// IVC Proof for SnarkFold (Figure 3 from paper)
-/// Πi = (hi, (u*i, π*i), (uC,i, wC,i), (u*C,i, w*C,i))
-#[derive(Clone, Debug)]
-pub struct IVCProof {
-    /// Binding claim hi = Hash(ui, hi-1)
+/// One folding step as seen by the verifier.
+#[derive(Clone, Debug, PartialEq, Eq, CanonicalSerialize, CanonicalDeserialize)]
+pub struct FoldStep {
+    pub instance: Instance,
+    pub cross_terms: CrossTerms,
+}
+
+/// Aggregated proof for `steps.len()` Groth16 proofs under one verifying key.
+#[derive(Clone, Debug, PartialEq, Eq, CanonicalSerialize, CanonicalDeserialize)]
+pub struct AggregatedProof {
+    pub steps: Vec<FoldStep>,
+    /// hₙ = Hash(uₙ, Hash(uₙ₋₁, … Hash(u₁, 0)))
     pub binding_claim: FieldElement,
-
-    /// Running SNARK instance-proof pair
-    pub running_snark_instance: AugmentedRelaxedInstance,
-    pub running_snark_proof: AugmentedRelaxedProof,
-
-    /// Circuit instance-witness (for recursive circuit)
-    pub circuit_instance: CircuitInstance,
-    pub circuit_witness: CircuitWitness,
-
-    /// Running circuit instance-witness
-    pub running_circuit_instance: CircuitInstance,
-    pub running_circuit_witness: CircuitWitness,
+    pub instance: AugmentedRelaxedInstance,
+    pub proof: AugmentedRelaxedProof,
 }
 
-/// Circuit instance (simplified)
+impl AggregatedProof {
+    pub fn num_proofs(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Public inputs of every folded proof, in order (what a contract needs to apply state).
+    pub fn instances(&self) -> impl Iterator<Item = &Instance> {
+        self.steps.iter().map(|s| &s.instance)
+    }
+}
+
+/// Incremental prover state.
 #[derive(Clone, Debug)]
-pub struct CircuitInstance {
-    pub public_hash: FieldElement,
-    pub is_relaxed: bool,
+pub struct Aggregator {
+    len: usize,
+    steps: Vec<FoldStep>,
+    binding_claim: FieldElement,
+    instance: AugmentedRelaxedInstance,
+    proof: AugmentedRelaxedProof,
 }
 
-/// Circuit witness (simplified)
-#[derive(Clone, Debug)]
-pub struct CircuitWitness {
-    // In practice this would contain R1CS witness
-    pub dummy: Vec<FieldElement>,
-}
-
-/// IVC Prover for SnarkFold
-pub struct IVCProver;
-
-impl IVCProver {
-    /// Initialize IVC with trivial proof (step 0)
-    pub fn init() -> IVCProof {
-        let trivial_instance = AugmentedRelaxedInstance {
-            a_vec: vec![FieldElement::zero()],
-            mu: FieldElement::one(),
-            error_gt: vec![],
-            r: G1::zero(),
-            t_vec: vec![FieldElement::zero()],
-            kappa: FieldElement::zero(),
-        };
-
-        let trivial_proof = AugmentedRelaxedProof {
-            a: G1::zero(),
-            b: G2::zero(),
-            c: G1::zero(),
-        };
-
-        let trivial_circuit_instance = CircuitInstance {
-            public_hash: FieldElement::zero(),
-            is_relaxed: false,
-        };
-
-        let trivial_circuit_witness = CircuitWitness { dummy: vec![] };
-
-        IVCProof {
+impl Aggregator {
+    /// `vk` fixes the instance length; every pushed proof must be for this key.
+    pub fn new(vk: &GrothVerifyingKey) -> Self {
+        let len = vk.instance_len();
+        Self {
+            len,
+            steps: Vec::new(),
             binding_claim: FieldElement::zero(),
-            running_snark_instance: trivial_instance.clone(),
-            running_snark_proof: trivial_proof.clone(),
-            circuit_instance: trivial_circuit_instance.clone(),
-            circuit_witness: trivial_circuit_witness.clone(),
-            running_circuit_instance: trivial_instance.clone().into(),
-            running_circuit_witness: trivial_circuit_witness,
+            instance: AugmentedRelaxedInstance::zero(len),
+            proof: AugmentedRelaxedProof::zero(),
         }
     }
 
-    /// IVC step: aggregate one more proof (Algorithm from Figure 3)
-    /// Πi ← IVC.P(pk, i, (ui, πi), Πi−1)
-    pub fn prove_step(
-        step: usize,
-        instance: &Instance,
-        proof: &Proof,
-        previous_ivc_proof: &IVCProof,
-    ) -> Result<IVCProof> {
-        // Step 1: Compute new binding claim
-        // hi ← Hash(ui, hi-1)
-        let instance_hash = Self::hash_instance(instance)?;
-        let binding_claim =
-            SnarkFoldHash::hash_two(&instance_hash, &previous_ivc_proof.binding_claim)?;
+    pub fn num_proofs(&self) -> usize {
+        self.steps.len()
+    }
 
-        // Step 2: Convert current proof to augmented relaxed form
-        let current_instance = AugmentedRelaxedInstance::from_instance(instance);
-        let current_proof: AugmentedRelaxedProof = proof.clone().into();
+    /// Fold one more (instance, proof). The caller is expected to have verified the Groth16
+    /// proof already (an invalid proof makes the whole batch fail verification).
+    pub fn push(&mut self, instance: &Instance, proof: &Proof) -> SnarkFoldResult<()> {
+        if instance.public_inputs.len() + 1 != self.len {
+            return Err(SnarkFoldError::InvalidInstance);
+        }
+        let fresh_inst = AugmentedRelaxedInstance::from_instance(instance);
+        let fresh_proof: AugmentedRelaxedProof = proof.clone().into();
 
-        // Step 3: Fold SNARK instances
-        // (u*i, π*i) ← FoldSNARK.P(pkFS, (ui, πi), (u*i-1, π*i-1))
         let cross_terms = AugmentedGroth16Folder::compute_cross_terms(
-            &current_proof,
-            &current_instance,
-            &previous_ivc_proof.running_snark_proof,
-            &previous_ivc_proof.running_snark_instance,
+            &fresh_proof,
+            &fresh_inst,
+            &self.proof,
+            &self.instance,
         )?;
-
-        let challenge = AugmentedGroth16Folder::generate_challenge(
-            &current_instance,
-            &previous_ivc_proof.running_snark_instance,
+        let r = AugmentedGroth16Folder::generate_challenge(&fresh_inst, &self.instance, &cross_terms)?;
+        let (inst, prf) = AugmentedGroth16Folder::fold_prover(
+            &fresh_proof,
+            &fresh_inst,
+            &self.proof,
+            &self.instance,
             &cross_terms,
+            r,
         )?;
 
-        let (running_snark_instance, running_snark_proof) = AugmentedGroth16Folder::fold_prover(
-            &current_proof,
-            &current_instance,
-            &previous_ivc_proof.running_snark_proof,
-            &previous_ivc_proof.running_snark_instance,
-            &cross_terms,
-            challenge,
-        )?;
-
-        // Step 4: Fold circuit instances (simplified for now)
-        // In a full implementation, this would fold R1CS instances using Nova-style folding
-        let circuit_instance =
-            Self::create_circuit_instance(step, &binding_claim, &running_snark_instance)?;
-
-        let circuit_witness = CircuitWitness { dummy: vec![] };
-
-        let running_circuit_instance = circuit_instance.clone();
-        let running_circuit_witness = circuit_witness.clone();
-
-        Ok(IVCProof {
-            binding_claim,
-            running_snark_instance,
-            running_snark_proof,
-            circuit_instance,
-            circuit_witness,
-            running_circuit_instance,
-            running_circuit_witness,
-        })
+        let instance_hash = SnarkFoldHash::hash_many(&instance.public_inputs)?;
+        self.binding_claim = SnarkFoldHash::hash_two(&instance_hash, &self.binding_claim)?;
+        self.instance = inst;
+        self.proof = prf;
+        self.steps.push(FoldStep { instance: instance.clone(), cross_terms });
+        Ok(())
     }
 
-    /// Hash an instance to a field element
-    fn hash_instance(instance: &Instance) -> Result<FieldElement> {
-        SnarkFoldHash::hash_many(&instance.public_inputs)
-    }
-
-    /// Create circuit instance (simplified)
-    fn create_circuit_instance(
-        step: usize,
-        binding_claim: &FieldElement,
-        running_instance: &AugmentedRelaxedInstance,
-    ) -> Result<CircuitInstance> {
-        // In practice: uC,i.x ← Hash(vk, i, hi, u*i, u*C,i)
-        let mut data = vec![FieldElement::from(step as u64), *binding_claim];
-        data.extend_from_slice(&running_instance.a_vec);
-        data.push(running_instance.mu);
-
-        let public_hash = SnarkFoldHash::hash_many(&data)?;
-
-        Ok(CircuitInstance {
-            public_hash,
-            is_relaxed: !running_instance.is_non_relaxed(),
-        })
+    pub fn finish(self) -> AggregatedProof {
+        AggregatedProof {
+            steps: self.steps,
+            binding_claim: self.binding_claim,
+            instance: self.instance,
+            proof: self.proof,
+        }
     }
 }
 
-/// IVC Verifier
-pub struct IVCVerifier;
-
-impl IVCVerifier {
-    /// Verify IVC proof (complete implementation)
-    /// 0/1 ← IVC.V(vk, i, Πi)
-    /// Implements verification logic from Figure 3 of the paper
-    pub fn verify(
-        step: usize,
-        ivc_proof: &IVCProof,
-        verifying_key: &GrothVerifyingKey,
-    ) -> Result<bool> {
-        // Check 1: Verify circuit instance hash
-        // uC,i.x = Hash(vk, i, hi, u*i, u*C,i)
-        let mut data = vec![FieldElement::from(step as u64), ivc_proof.binding_claim];
-        data.extend_from_slice(&ivc_proof.running_snark_instance.a_vec);
-        data.push(ivc_proof.running_snark_instance.mu);
-
-        let expected_hash = SnarkFoldHash::hash_many(&data)?;
-
-        if ivc_proof.circuit_instance.public_hash != expected_hash {
-            return Ok(false);
-        }
-
-        // Check 2: Verify circuit instance is non-relaxed
-        if ivc_proof.circuit_instance.is_relaxed {
-            return Ok(false);
-        }
-
-        // Check 3: Verify π*i is a satisfying proof to u*i
-        // This checks the augmented relaxed Groth16 relation (Definition 4 from paper)
-        if !Self::verify_augmented_relaxed_groth16(
-            &ivc_proof.running_snark_proof,
-            &ivc_proof.running_snark_instance,
-            verifying_key,
-        )? {
-            return Ok(false);
-        }
-
-        // Check 4: Verify circuit witnesses are satisfying
-        // In a complete implementation, this would verify the R1CS relation
-        // For now we perform a basic consistency check
-        if !Self::verify_circuit_witnesses(
-            &ivc_proof.circuit_instance,
-            &ivc_proof.circuit_witness,
-            &ivc_proof.running_circuit_instance,
-            &ivc_proof.running_circuit_witness,
-        )? {
-            return Ok(false);
-        }
-
-        Ok(true)
+/// Fold a whole batch at once.
+pub fn aggregate(vk: &GrothVerifyingKey, batch: &[(Instance, Proof)]) -> SnarkFoldResult<AggregatedProof> {
+    let mut agg = Aggregator::new(vk);
+    for (u, p) in batch {
+        agg.push(u, p)?;
     }
-
-    /// Verify augmented relaxed Groth16 proof (Definition 4 from paper)
-    /// Checks: e(A,B) · e(C,[δ]2)^(-μ) · e(H,[γ]2)^(-μ) · D^(-μ²) = E · e(R,[δ]2) · e(S,[γ]2) · D^κ
-    fn verify_augmented_relaxed_groth16(
-        proof: &AugmentedRelaxedProof,
-        instance: &AugmentedRelaxedInstance,
-        vk: &GrothVerifyingKey,
-    ) -> Result<bool> {
-        // Compute H = Σ(Si^ai) where Si are from the verification key
-        let mut h = G1::zero();
-        for (i, ai) in instance.a_vec.iter().enumerate() {
-            if i < vk.gamma_abc_g1.len() {
-                h += vk.gamma_abc_g1[i] * ai;
-            }
-        }
-
-        // Compute S = Σ(Si^ti)
-        let mut s = G1::zero();
-        for (i, ti) in instance.t_vec.iter().enumerate() {
-            if i < vk.gamma_abc_g1.len() {
-                s += vk.gamma_abc_g1[i] * ti;
-            }
-        }
-
-        // Compute D = e(α, β)
-        let d = Bn254::pairing(vk.alpha_g1, vk.beta_g2);
-
-        // Compute left side: e(A,B) · e(C,[δ]2)^(-μ) · e(H,[γ]2)^(-μ) · D^(-μ²)
-        let lhs_ab = Bn254::pairing(proof.a, proof.b);
-
-        let neg_mu = -instance.mu;
-        let c_neg_mu = proof.c * neg_mu;
-        let lhs_c = Bn254::pairing(c_neg_mu, vk.delta_g2);
-
-        let h_neg_mu = h * neg_mu;
-        let lhs_h = Bn254::pairing(h_neg_mu, vk.gamma_g2);
-
-        // Scale D by -μ² using scalar multiplication in GT
-        let neg_mu_squared = -(instance.mu * instance.mu);
-        let lhs_d = d.0.pow(neg_mu_squared.into_bigint());
-
-        // Compute LHS in GT using multiplicative notation
-        let lhs = lhs_ab.0 * lhs_c.0 * lhs_h.0 * lhs_d;
-
-        // Compute right side: E · e(R,[δ]2) · e(S,[γ]2) · D^κ
-        // Convert from serialized bytes to GT element
-        let e_pairing = if instance.error_gt.is_empty() {
-            crate::GT::zero()
-        } else {
-            crate::GT::deserialize_compressed(&instance.error_gt[..])
-                .map_err(|e| crate::SnarkFoldError::VerificationError(e.to_string()))?
-        };
-
-        let rhs_r = Bn254::pairing(instance.r, vk.delta_g2);
-        let rhs_s = Bn254::pairing(s, vk.gamma_g2);
-
-        // Scale D by kappa using scalar multiplication in GT
-        let rhs_d = d.0.pow(instance.kappa.into_bigint());
-
-        let rhs = e_pairing * rhs_r.0 * rhs_s.0 * rhs_d;
-
-        // Check if lhs == rhs
-        Ok(lhs == rhs)
-    }
-
-    /// Verify circuit witnesses (simplified check)
-    /// In a complete implementation, this would verify R1CS constraints
-    fn verify_circuit_witnesses(
-        circuit_instance: &CircuitInstance,
-        _circuit_witness: &CircuitWitness,
-        _running_circuit_instance: &CircuitInstance,
-        _running_circuit_witness: &CircuitWitness,
-    ) -> Result<bool> {
-        // Basic consistency check: both instances should have compatible types
-        // In a full implementation, this would check the R1CS relation:
-        // Az ⊙ Bz = Cz where z is the witness vector
-
-        // Check that circuit instance is non-relaxed
-        if circuit_instance.is_relaxed {
-            return Ok(false);
-        }
-
-        // Check running instance consistency
-        // The running instance may be relaxed after folding
-        Ok(true)
-    }
+    Ok(agg.finish())
 }
 
-impl From<AugmentedRelaxedInstance> for CircuitInstance {
-    fn from(inst: AugmentedRelaxedInstance) -> Self {
-        CircuitInstance {
-            public_hash: FieldElement::zero(), // Placeholder
-            is_relaxed: !inst.is_non_relaxed(),
-        }
+/// Verify an aggregated proof: replay the instance folding from the transcript, check it
+/// reproduces the claimed final instance and binding claim, then check the relaxed relation.
+pub fn verify_aggregated(vk: &GrothVerifyingKey, agg: &AggregatedProof) -> SnarkFoldResult<bool> {
+    let len = vk.instance_len();
+    if agg.steps.is_empty() {
+        return Ok(false);
     }
+    let mut inst = AugmentedRelaxedInstance::zero(len);
+    let mut binding = FieldElement::zero();
+    for step in &agg.steps {
+        if step.instance.public_inputs.len() + 1 != len {
+            return Ok(false);
+        }
+        let fresh = AugmentedRelaxedInstance::from_instance(&step.instance);
+        let r = AugmentedGroth16Folder::generate_challenge(&fresh, &inst, &step.cross_terms)?;
+        inst = AugmentedGroth16Folder::fold_verifier(&fresh, &inst, &step.cross_terms, r)?;
+        let h = SnarkFoldHash::hash_many(&step.instance.public_inputs)?;
+        binding = SnarkFoldHash::hash_two(&h, &binding)?;
+    }
+    if inst != agg.instance || binding != agg.binding_claim {
+        return Ok(false);
+    }
+    verify_relaxed(&agg.proof, &agg.instance, vk)
 }
 
 #[cfg(test)]
 mod tests {
+    //! Real Groth16 proofs for a tiny circuit  c = a · b  (public: c).
     use super::*;
-    use crate::{FieldElement, G1, G2};
-    use ark_std::rand::SeedableRng;
-    use ark_std::{UniformRand, Zero};
+    use ark_bn254::{Bn254, Fr};
+    use ark_crypto_primitives::snark::SNARK;
+    use ark_groth16::Groth16;
+    use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar};
+    use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+    use ark_std::{rand::SeedableRng, UniformRand};
     use rand_chacha::ChaCha20Rng;
 
-    #[test]
-    fn test_ivc_init() {
-        let ivc_proof = IVCProver::init();
-        assert_eq!(ivc_proof.binding_claim, FieldElement::zero());
+    #[derive(Clone)]
+    struct Mul {
+        a: Fr,
+        b: Fr,
+    }
+    impl ConstraintSynthesizer<Fr> for Mul {
+        fn generate_constraints(
+            self,
+            cs: ConstraintSystemRef<Fr>,
+        ) -> core::result::Result<(), SynthesisError> {
+            let c = FpVar::new_input(cs.clone(), || Ok(self.a * self.b))?;
+            let a = FpVar::new_witness(cs.clone(), || Ok(self.a))?;
+            let b = FpVar::new_witness(cs.clone(), || Ok(self.b))?;
+            (a * b).enforce_equal(&c)
+        }
+    }
+
+    fn setup_and_prove(seed: u8, n: usize) -> (GrothVerifyingKey, Vec<(Instance, Proof)>) {
+        let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+        let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(
+            Mul { a: Fr::from(1u64), b: Fr::from(1u64) },
+            &mut rng,
+        )
+        .unwrap();
+        let batch = (0..n)
+            .map(|_| {
+                let a = Fr::rand(&mut rng);
+                let b = Fr::rand(&mut rng);
+                let proof = Groth16::<Bn254>::prove(&pk, Mul { a, b }, &mut rng).unwrap();
+                assert!(Groth16::<Bn254>::verify(&vk, &[a * b], &proof).unwrap());
+                (Instance { public_inputs: vec![a * b] }, Proof::from(proof))
+            })
+            .collect();
+        (GrothVerifyingKey::from_ark_vk(&vk), batch)
     }
 
     #[test]
-    fn test_ivc_single_step() {
-        let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
+    fn test_plain_and_zero_pairs_satisfy_relaxed_relation() {
+        let (vk, batch) = setup_and_prove(7, 1);
+        let inst = AugmentedRelaxedInstance::from_instance(&batch[0].0);
+        assert!(verify_relaxed(&batch[0].1.clone().into(), &inst, &vk).unwrap());
+        assert!(verify_relaxed(
+            &AugmentedRelaxedProof::zero(),
+            &AugmentedRelaxedInstance::zero(vk.instance_len()),
+            &vk
+        )
+        .unwrap());
+    }
 
-        let instance = Instance {
-            public_inputs: vec![FieldElement::rand(&mut rng)],
-        };
+    #[test]
+    fn test_aggregate_real_proofs() {
+        let (vk, batch) = setup_and_prove(7, 8);
+        let agg = aggregate(&vk, &batch).unwrap();
+        assert_eq!(agg.num_proofs(), 8);
+        assert!(verify_aggregated(&vk, &agg).unwrap());
+        assert_eq!(agg.instances().count(), 8);
 
-        let proof = Proof {
-            a: G1::rand(&mut rng),
-            b: G2::rand(&mut rng),
-            c: G1::rand(&mut rng),
-        };
+        let mut bytes = vec![];
+        agg.serialize_compressed(&mut bytes).unwrap();
+        let back = AggregatedProof::deserialize_compressed(&bytes[..]).unwrap();
+        assert!(verify_aggregated(&vk, &back).unwrap());
+        println!("aggregated proof for 8: {} bytes ({} per proof)", bytes.len(), bytes.len() / 8);
+    }
 
-        let initial_ivc = IVCProver::init();
+    #[test]
+    fn test_incremental_matches_batch() {
+        let (vk, batch) = setup_and_prove(7, 3);
+        let mut agg = Aggregator::new(&vk);
+        for (u, p) in &batch {
+            agg.push(u, p).unwrap();
+        }
+        assert_eq!(agg.finish(), aggregate(&vk, &batch).unwrap());
+    }
 
-        let ivc_proof = IVCProver::prove_step(1, &instance, &proof, &initial_ivc).unwrap();
+    #[test]
+    fn test_tampered_transcript_rejected() {
+        let (vk, batch) = setup_and_prove(7, 4);
+        let agg = aggregate(&vk, &batch).unwrap();
 
-        assert_ne!(ivc_proof.binding_claim, FieldElement::zero());
+        let mut t = agg.clone();
+        t.steps[1].instance.public_inputs[0] += Fr::from(1u64);
+        assert!(!verify_aggregated(&vk, &t).unwrap());
+
+        let mut t = agg.clone();
+        t.instance.mu += Fr::from(1u64);
+        assert!(!verify_aggregated(&vk, &t).unwrap());
+
+        let mut t = agg;
+        t.binding_claim += Fr::from(1u64);
+        assert!(!verify_aggregated(&vk, &t).unwrap());
+    }
+
+    #[test]
+    fn test_forged_statement_rejected() {
+        let (vk, mut batch) = setup_and_prove(7, 4);
+        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
+        // a valid proof presented for a different public input
+        batch[2].0.public_inputs[0] = Fr::rand(&mut rng);
+        let agg = aggregate(&vk, &batch).unwrap();
+        assert!(!verify_aggregated(&vk, &agg).unwrap());
+    }
+
+    #[test]
+    fn test_wrong_key_rejected() {
+        let (vk, batch) = setup_and_prove(7, 2);
+        let (other_vk, _) = setup_and_prove(8, 0);
+        assert_ne!(vk, other_vk);
+        let agg = aggregate(&vk, &batch).unwrap();
+        assert!(!verify_aggregated(&other_vk, &agg).unwrap());
+    }
+
+    #[test]
+    fn test_empty_rejected_and_length_checked() {
+        let (vk, _) = setup_and_prove(7, 0);
+        assert!(!verify_aggregated(&vk, &Aggregator::new(&vk).finish()).unwrap());
+        let mut a = Aggregator::new(&vk);
+        assert!(a
+            .push(
+                &Instance { public_inputs: vec![Fr::from(1u64), Fr::from(2u64)] },
+                &Proof::from(ark_groth16::Proof::<Bn254>::default())
+            )
+            .is_err());
     }
 }

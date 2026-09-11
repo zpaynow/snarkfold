@@ -1,3 +1,7 @@
+//! SnarkFold-style aggregation of Groth16 proofs over BN254.
+//!
+//! See [`ivc`] for the aggregation API and its exact (non-)succinctness guarantees.
+
 pub mod error;
 pub mod folding;
 pub mod groth16;
@@ -20,13 +24,5 @@ use ark_ec::pairing::Pairing;
 pub type FieldElement = Fr;
 pub type G1 = G1Projective;
 pub type G2 = G2Projective;
+/// Target group element (Fq12); multiplicative, identity is `GT::one()`.
 pub type GT = <Bn254 as Pairing>::TargetField;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
-    }
-}

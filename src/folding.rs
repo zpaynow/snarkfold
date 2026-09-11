@@ -1,117 +1,107 @@
+//! Folding scheme for augmented relaxed Groth16 (Section 4.1 of the paper).
+//!
+//! Given two satisfying pairs (u₁, π₁), (u₂, π₂) for the same verifying key, the prover
+//! publishes cross terms T = (T', R, ⃗t, κ), both sides derive r = Hash(u₁, u₂, T), and the
+//! folded pair
+//!
+//! ```text
+//! ⃗a* = ⃗a₁ + r·⃗a₂        μ* = μ₁ + r·μ₂
+//! E*  = E₁ · T'^r · E₂^(r²)    R* = R₁ + r·R + r²·R₂
+//! ⃗t* = ⃗t₁ + r·⃗t + r²·⃗t₂    κ* = κ₁ + r·κ + r²·κ₂
+//! A*  = A₁ + r·A₂    B* = B₁ + r·B₂    C* = C₁ + r·C₂
+//! ```
+//!
+//! satisfies the relation again. The signs of the cross terms follow from expanding the
+//! relation in `groth16.rs` with (⃗a*, μ*): R = −(μ₂C₁ + μ₁C₂), ⃗t = −(μ₂⃗a₁ + μ₁⃗a₂), κ = −2μ₁μ₂.
+
 use ark_bn254::Bn254;
 use ark_ec::pairing::Pairing;
 use ark_ff::{Field, PrimeField};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_std::{vec::Vec, Zero};
+use ark_serialize::CanonicalSerialize;
+use ark_std::vec::Vec;
 use sha3::{Digest, Keccak256};
 
-use crate::{groth16::*, FieldElement, SnarkFoldError, SnarkFoldResult as Result, GT};
+use crate::{groth16::*, FieldElement, SnarkFoldError, SnarkFoldResult, G1};
 
-/// Augmented Relaxed Groth16 Folding Scheme
-/// Implements the protocol from Section 4.1 of the paper
 pub struct AugmentedGroth16Folder;
 
 impl AugmentedGroth16Folder {
-    /// Helper function to accumulate GT error terms
-    /// Computes E* = E1 · (T')^r · (E2)^(r²)
-    fn accumulate_gt_error(
-        e1_bytes: &[u8],
-        t_prime_bytes: &[u8],
-        e2_bytes: &[u8],
-        r: FieldElement,
-        r_squared: FieldElement,
-    ) -> Result<Vec<u8>> {
-        // Deserialize GT elements (or use identity if empty)
-        let e1 = if e1_bytes.is_empty() {
-            GT::zero()
-        } else {
-            GT::deserialize_compressed(e1_bytes)
-                .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?
-        };
-
-        let t_prime = if t_prime_bytes.is_empty() {
-            GT::zero()
-        } else {
-            GT::deserialize_compressed(t_prime_bytes)
-                .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?
-        };
-
-        let e2 = if e2_bytes.is_empty() {
-            GT::zero()
-        } else {
-            GT::deserialize_compressed(e2_bytes)
-                .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?
-        };
-
-        // Compute E* = E1 · (T')^r · (E2)^(r²)
-        // In GT (multiplicative group), exponentiation is scalar multiplication
-        let t_prime_r = t_prime.pow(r.into_bigint());
-        let e2_r_squared = e2.pow(r_squared.into_bigint());
-        let e_star = e1 * t_prime_r * e2_r_squared;
-
-        // Serialize result
-        let mut result = Vec::new();
-        e_star
-            .serialize_compressed(&mut result)
-            .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?;
-
-        Ok(result)
-    }
-
-    /// Compute cross terms (Equation 3 from paper)
-    /// T = (T', R, ⃗t, κ) where:
-    /// - T' = e(A1, B2) · e(A2, B1)
-    /// - R = C1^(-μ2) · C2^(-μ1)
-    /// - ⃗t = μ2⃗a1 + μ1⃗a2
-    /// - κ = -2μ1μ2
+    /// Cross terms (Equation 3).
     pub fn compute_cross_terms(
         proof1: &AugmentedRelaxedProof,
         inst1: &AugmentedRelaxedInstance,
         proof2: &AugmentedRelaxedProof,
         inst2: &AugmentedRelaxedInstance,
-    ) -> Result<CrossTerms> {
-        // Compute T' = e(A1, B2) · e(A2, B1)
-        let pairing1 = Bn254::pairing(proof1.a, proof2.b);
-        let pairing2 = Bn254::pairing(proof2.a, proof1.b);
-        let t_prime_gt = pairing1 + pairing2;
-
-        let mut t_prime_bytes = Vec::new();
-        t_prime_gt
-            .serialize_compressed(&mut t_prime_bytes)
-            .map_err(|e| SnarkFoldError::SerializationError(e.to_string()))?;
-
-        // Compute R = C1^(-μ2) · C2^(-μ1)
-        let neg_mu2 = -inst2.mu;
-        let neg_mu1 = -inst1.mu;
-        let r = (proof1.c * neg_mu2) + (proof2.c * neg_mu1);
-
-        // Compute ⃗t = μ2⃗a1 + μ1⃗a2
+    ) -> SnarkFoldResult<CrossTerms> {
         let len = inst1.a_vec.len();
-        if len != inst2.a_vec.len() {
+        if len != inst2.a_vec.len() || inst1.t_vec.len() != len || inst2.t_vec.len() != len {
             return Err(SnarkFoldError::FoldingError(
                 "Instance vectors must have same length".to_string(),
             ));
         }
 
-        let mut t_vec = Vec::with_capacity(len);
-        for i in 0..len {
-            let t_i = inst2.mu * inst1.a_vec[i] + inst1.mu * inst2.a_vec[i];
-            t_vec.push(t_i);
-        }
+        // T' = e(A1, B2) · e(A2, B1)  (PairingOutput addition is GT multiplication)
+        let t_prime = (Bn254::pairing(proof1.a, proof2.b) + Bn254::pairing(proof2.a, proof1.b)).0;
 
-        // Compute κ = -2μ1μ2
-        let kappa = -FieldElement::from(2u64) * inst1.mu * inst2.mu;
+        // R = −(μ2·C1 + μ1·C2)
+        let r = -(proof1.c * inst2.mu + proof2.c * inst1.mu);
 
-        Ok(CrossTerms {
-            t_prime: t_prime_bytes,
-            r,
-            t_vec,
-            kappa,
-        })
+        // ⃗t = −(μ2·⃗a1 + μ1·⃗a2)
+        let t_vec = inst1
+            .a_vec
+            .iter()
+            .zip(&inst2.a_vec)
+            .map(|(a1, a2)| -(inst2.mu * a1 + inst1.mu * a2))
+            .collect();
+
+        // κ = −2·μ1·μ2
+        let kappa = -(FieldElement::from(2u64) * inst1.mu * inst2.mu);
+
+        Ok(CrossTerms { t_prime, r, t_vec, kappa })
     }
 
-    /// Prover's folding operation (Equation 4 from paper)
-    /// Folds two instance-proof pairs into one
+    /// Fold the two instances (what both prover and verifier compute).
+    pub fn fold_instances(
+        inst1: &AugmentedRelaxedInstance,
+        inst2: &AugmentedRelaxedInstance,
+        cross_terms: &CrossTerms,
+        r: FieldElement,
+    ) -> SnarkFoldResult<AugmentedRelaxedInstance> {
+        let len = inst1.a_vec.len();
+        if len != inst2.a_vec.len() || cross_terms.t_vec.len() != len {
+            return Err(SnarkFoldError::FoldingError(
+                "Instance vectors must have same length".to_string(),
+            ));
+        }
+        let r2 = r * r;
+
+        let a_vec = inst1.a_vec.iter().zip(&inst2.a_vec).map(|(x, y)| *x + r * y).collect();
+        let mu = inst1.mu + r * inst2.mu;
+        let error =
+            inst1.error * cross_terms.t_prime.pow(r.into_bigint()) * inst2.error.pow(r2.into_bigint());
+        let r_acc = inst1.r + cross_terms.r * r + inst2.r * r2;
+        let t_vec = (0..len)
+            .map(|i| inst1.t_vec[i] + r * cross_terms.t_vec[i] + r2 * inst2.t_vec[i])
+            .collect();
+        let kappa = inst1.kappa + r * cross_terms.kappa + r2 * inst2.kappa;
+
+        Ok(AugmentedRelaxedInstance { a_vec, mu, error, r: r_acc, t_vec, kappa })
+    }
+
+    /// Fold the two proofs (prover only).
+    pub fn fold_proofs(
+        proof1: &AugmentedRelaxedProof,
+        proof2: &AugmentedRelaxedProof,
+        r: FieldElement,
+    ) -> AugmentedRelaxedProof {
+        AugmentedRelaxedProof {
+            a: proof1.a + proof2.a * r,
+            b: proof1.b + proof2.b * r,
+            c: proof1.c + proof2.c * r,
+        }
+    }
+
+    /// Prover's folding: instances and proofs.
     pub fn fold_prover(
         proof1: &AugmentedRelaxedProof,
         inst1: &AugmentedRelaxedInstance,
@@ -119,249 +109,106 @@ impl AugmentedGroth16Folder {
         inst2: &AugmentedRelaxedInstance,
         cross_terms: &CrossTerms,
         challenge: FieldElement,
-    ) -> Result<(AugmentedRelaxedInstance, AugmentedRelaxedProof)> {
-        let r = challenge;
-        let r_squared = r * r;
-
-        // Fold instance: (⃗a*, μ*, E*, R*, ⃗t*, κ*)
-
-        // ⃗a* = ⃗a1 + r · ⃗a2
-        let len = inst1.a_vec.len();
-        let mut a_vec_star = Vec::with_capacity(len);
-        for i in 0..len {
-            a_vec_star.push(inst1.a_vec[i] + r * inst2.a_vec[i]);
-        }
-
-        // μ* = μ1 + r · μ2
-        let mu_star = inst1.mu + r * inst2.mu;
-
-        // E* = E1 · (T')^r · (E2)^(r²)
-        // Implement proper GT accumulation as per Equation 4 from the paper
-        let error_gt_star = Self::accumulate_gt_error(
-            &inst1.error_gt,
-            &cross_terms.t_prime,
-            &inst2.error_gt,
-            r,
-            r_squared,
-        )?;
-
-        // R* = R1 · R^r · (R2)^(r²)
-        let r_star = inst1.r + (cross_terms.r * r) + (inst2.r * r_squared);
-
-        // ⃗t* = ⃗t1 + r·⃗t + r²·⃗t2
-        let mut t_vec_star = Vec::with_capacity(len);
-        for i in 0..len {
-            t_vec_star.push(inst1.t_vec[i] + r * cross_terms.t_vec[i] + r_squared * inst2.t_vec[i]);
-        }
-
-        // κ* = κ1 + r·κ + r²·κ2
-        let kappa_star = inst1.kappa + r * cross_terms.kappa + r_squared * inst2.kappa;
-
-        let folded_instance = AugmentedRelaxedInstance {
-            a_vec: a_vec_star,
-            mu: mu_star,
-            error_gt: error_gt_star,
-            r: r_star,
-            t_vec: t_vec_star,
-            kappa: kappa_star,
-        };
-
-        // Fold proof: (A*, B*, C*)
-        // A* = A1 · A2^r
-        let a_star = proof1.a + (proof2.a * r);
-
-        // B* = B1 · B2^r
-        let b_star = proof1.b + (proof2.b * r);
-
-        // C* = C1 · C2^r
-        let c_star = proof1.c + (proof2.c * r);
-
-        let folded_proof = AugmentedRelaxedProof {
-            a: a_star,
-            b: b_star,
-            c: c_star,
-        };
-
-        Ok((folded_instance, folded_proof))
+    ) -> SnarkFoldResult<(AugmentedRelaxedInstance, AugmentedRelaxedProof)> {
+        let inst = Self::fold_instances(inst1, inst2, cross_terms, challenge)?;
+        Ok((inst, Self::fold_proofs(proof1, proof2, challenge)))
     }
 
-    /// Verifier's folding operation
-    /// Only computes the folded instance (verifier doesn't need the proof)
+    /// Verifier's folding (instances only).
     pub fn fold_verifier(
         inst1: &AugmentedRelaxedInstance,
         inst2: &AugmentedRelaxedInstance,
         cross_terms: &CrossTerms,
         challenge: FieldElement,
-    ) -> Result<AugmentedRelaxedInstance> {
-        let r = challenge;
-        let r_squared = r * r;
-
-        let len = inst1.a_vec.len();
-        let mut a_vec_star = Vec::with_capacity(len);
-        for i in 0..len {
-            a_vec_star.push(inst1.a_vec[i] + r * inst2.a_vec[i]);
-        }
-
-        let mu_star = inst1.mu + r * inst2.mu;
-        let r_star = inst1.r + (cross_terms.r * r) + (inst2.r * r_squared);
-
-        let mut t_vec_star = Vec::with_capacity(len);
-        for i in 0..len {
-            t_vec_star.push(inst1.t_vec[i] + r * cross_terms.t_vec[i] + r_squared * inst2.t_vec[i]);
-        }
-
-        let kappa_star = inst1.kappa + r * cross_terms.kappa + r_squared * inst2.kappa;
-
-        Ok(AugmentedRelaxedInstance {
-            a_vec: a_vec_star,
-            mu: mu_star,
-            error_gt: Vec::new(),
-            r: r_star,
-            t_vec: t_vec_star,
-            kappa: kappa_star,
-        })
+    ) -> SnarkFoldResult<AugmentedRelaxedInstance> {
+        Self::fold_instances(inst1, inst2, cross_terms, challenge)
     }
 
-    /// Generate Fiat-Shamir challenge for non-interactive folding
+    /// Fiat–Shamir challenge r = Hash(inst1, inst2, T).
     pub fn generate_challenge(
         inst1: &AugmentedRelaxedInstance,
         inst2: &AugmentedRelaxedInstance,
         cross_terms: &CrossTerms,
-    ) -> Result<FieldElement> {
-        // Hash all public data to generate challenge
-        let mut data_to_hash = Vec::new();
-
-        // Serialize instances
-        inst1
-            .serialize_compressed(&mut data_to_hash)
-            .map_err(|e| SnarkFoldError::HashError(e.to_string()))?;
-        inst2
-            .serialize_compressed(&mut data_to_hash)
-            .map_err(|e| SnarkFoldError::HashError(e.to_string()))?;
-
-        // Serialize cross terms
-        data_to_hash.extend_from_slice(&cross_terms.t_prime);
-        cross_terms
-            .r
-            .serialize_compressed(&mut data_to_hash)
-            .map_err(|e| SnarkFoldError::HashError(e.to_string()))?;
-
-        for t in &cross_terms.t_vec {
-            t.serialize_compressed(&mut data_to_hash)
-                .map_err(|e| SnarkFoldError::HashError(e.to_string()))?;
-        }
-
-        cross_terms
-            .kappa
-            .serialize_compressed(&mut data_to_hash)
-            .map_err(|e| SnarkFoldError::HashError(e.to_string()))?;
-
-        // Hash to field element
-        let mut hasher = Keccak256::new();
-        hasher.update(&data_to_hash);
-        let hash_result = hasher.finalize();
-
-        Ok(FieldElement::from_le_bytes_mod_order(&hash_result))
+    ) -> SnarkFoldResult<FieldElement> {
+        let mut data = Vec::new();
+        let ser = |e: ark_serialize::SerializationError| SnarkFoldError::HashError(e.to_string());
+        data.extend_from_slice(b"snarkfold-groth16-fold-v1");
+        inst1.serialize_compressed(&mut data).map_err(ser)?;
+        inst2.serialize_compressed(&mut data).map_err(ser)?;
+        cross_terms.serialize_compressed(&mut data).map_err(ser)?;
+        let digest = Keccak256::digest(&data);
+        Ok(FieldElement::from_le_bytes_mod_order(&digest))
     }
+}
+
+/// Check the augmented relaxed relation for (u, π) against `vk` (3 pairings + 1 GT exponentiation).
+pub fn verify_relaxed(
+    proof: &AugmentedRelaxedProof,
+    inst: &AugmentedRelaxedInstance,
+    vk: &GrothVerifyingKey,
+) -> SnarkFoldResult<bool> {
+    vk.check_instance(inst)?;
+
+    // H = Σ aᵢ·Sᵢ,  S = Σ tᵢ·Sᵢ
+    let mut h = G1::default();
+    let mut s = G1::default();
+    for (i, base) in vk.gamma_abc_g1.iter().enumerate() {
+        h += *base * inst.a_vec[i];
+        s += *base * inst.t_vec[i];
+    }
+
+    // Move everything except E to the left:
+    // e(A,B) · e(−μC − R, δ) · e(−μH − S, γ) · e(α,β)^(−μ² − κ) = E
+    let neg_mu = -inst.mu;
+    let lhs = Bn254::multi_pairing(
+        [proof.a, proof.c * neg_mu - inst.r, h * neg_mu - s],
+        [proof.b, vk.delta_g2, vk.gamma_g2],
+    )
+    .0;
+    let d = Bn254::pairing(vk.alpha_g1, vk.beta_g2).0;
+    let exp = -(inst.mu * inst.mu) - inst.kappa;
+    Ok(lhs * d.pow(exp.into_bigint()) == inst.error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldElement, G1, G2};
-    use ark_std::{rand::SeedableRng, One, UniformRand, Zero};
+    use crate::G2;
+    use ark_ff::One;
+    use ark_std::{rand::SeedableRng, UniformRand};
     use rand_chacha::ChaCha20Rng;
 
     #[test]
-    fn test_cross_terms_computation() {
+    fn test_cross_terms_and_fold_shapes() {
         let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
-
-        let proof1 = AugmentedRelaxedProof {
-            a: G1::rand(&mut rng),
-            b: G2::rand(&mut rng),
-            c: G1::rand(&mut rng),
+        let mk = |rng: &mut ChaCha20Rng| {
+            (
+                AugmentedRelaxedProof { a: G1::rand(rng), b: G2::rand(rng), c: G1::rand(rng) },
+                AugmentedRelaxedInstance::from_instance(&Instance {
+                    public_inputs: vec![FieldElement::rand(rng)],
+                }),
+            )
         };
-
-        let inst1 = AugmentedRelaxedInstance {
-            a_vec: vec![FieldElement::rand(&mut rng), FieldElement::rand(&mut rng)],
-            mu: FieldElement::one(),
-            error_gt: vec![],
-            r: G1::zero(),
-            t_vec: vec![FieldElement::zero(), FieldElement::zero()],
-            kappa: FieldElement::zero(),
-        };
-
-        let proof2 = AugmentedRelaxedProof {
-            a: G1::rand(&mut rng),
-            b: G2::rand(&mut rng),
-            c: G1::rand(&mut rng),
-        };
-
-        let inst2 = AugmentedRelaxedInstance {
-            a_vec: vec![FieldElement::rand(&mut rng), FieldElement::rand(&mut rng)],
-            mu: FieldElement::one(),
-            error_gt: vec![],
-            r: G1::zero(),
-            t_vec: vec![FieldElement::zero(), FieldElement::zero()],
-            kappa: FieldElement::zero(),
-        };
-
-        let cross_terms =
-            AugmentedGroth16Folder::compute_cross_terms(&proof1, &inst1, &proof2, &inst2).unwrap();
-
-        assert_eq!(cross_terms.t_vec.len(), 2);
+        let (p1, u1) = mk(&mut rng);
+        let (p2, u2) = mk(&mut rng);
+        let ct = AugmentedGroth16Folder::compute_cross_terms(&p1, &u1, &p2, &u2).unwrap();
+        assert_eq!(ct.t_vec.len(), 2);
+        assert_eq!(ct.kappa, -FieldElement::from(2u64));
+        let r = AugmentedGroth16Folder::generate_challenge(&u1, &u2, &ct).unwrap();
+        let (fu, fp) = AugmentedGroth16Folder::fold_prover(&p1, &u1, &p2, &u2, &ct, r).unwrap();
+        assert_eq!(fu.mu, FieldElement::one() + r);
+        assert_eq!(fp.a, p1.a + p2.a * r);
+        assert_eq!(AugmentedGroth16Folder::fold_verifier(&u1, &u2, &ct, r).unwrap(), fu);
     }
 
     #[test]
-    fn test_folding() {
-        let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
-
-        let proof1 = AugmentedRelaxedProof {
-            a: G1::rand(&mut rng),
-            b: G2::rand(&mut rng),
-            c: G1::rand(&mut rng),
-        };
-
-        let inst1 = AugmentedRelaxedInstance {
-            a_vec: vec![FieldElement::rand(&mut rng)],
-            mu: FieldElement::one(),
-            error_gt: vec![],
-            r: G1::zero(),
-            t_vec: vec![FieldElement::zero()],
-            kappa: FieldElement::zero(),
-        };
-
-        let proof2 = AugmentedRelaxedProof {
-            a: G1::rand(&mut rng),
-            b: G2::rand(&mut rng),
-            c: G1::rand(&mut rng),
-        };
-
-        let inst2 = AugmentedRelaxedInstance {
-            a_vec: vec![FieldElement::rand(&mut rng)],
-            mu: FieldElement::one(),
-            error_gt: vec![],
-            r: G1::zero(),
-            t_vec: vec![FieldElement::zero()],
-            kappa: FieldElement::zero(),
-        };
-
-        let cross_terms =
-            AugmentedGroth16Folder::compute_cross_terms(&proof1, &inst1, &proof2, &inst2).unwrap();
-
-        let challenge = FieldElement::rand(&mut rng);
-
-        let (folded_inst, folded_proof) = AugmentedGroth16Folder::fold_prover(
-            &proof1,
-            &inst1,
-            &proof2,
-            &inst2,
-            &cross_terms,
-            challenge,
-        )
-        .unwrap();
-
-        assert!(!folded_proof.a.is_zero());
-        assert_eq!(folded_inst.a_vec.len(), 1);
+    fn test_length_mismatch_rejected() {
+        let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
+        let p = AugmentedRelaxedProof::zero();
+        let u1 = AugmentedRelaxedInstance::from_instance(&Instance {
+            public_inputs: vec![FieldElement::rand(&mut rng)],
+        });
+        let u2 = AugmentedRelaxedInstance::zero(5);
+        assert!(AugmentedGroth16Folder::compute_cross_terms(&p, &u1, &p, &u2).is_err());
     }
 }
